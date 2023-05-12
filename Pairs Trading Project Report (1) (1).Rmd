@@ -1,0 +1,575 @@
+---
+title: "Pairs Trading"
+author: "Michael Montemurri"
+date: "2023-04-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Our case study focuses on the pairs trading strategy. This was one of the first strategies based on computer-intensive analysis on past stock performance developed at Morgan Stanley in the 1980's.The idea is to find two positively correlated stocks. When the ratio of the stock prices strays outside of a designated range from the historical mean, this indicates that one of the stocks is likely over or under valued. We then buy one stock and sell the other. When the ratio returns to the mean we close both positions.
+Our objective is to use historical data to find the optimal range in order to maximize profit.
+
+The data is obtained from Yahoo! Finance. The data sets contain the historical values in the form of .csv files. It contains daily values (open, high, low, close, adjusted close, and volume) for the price of the stock every day. In this project we only used the adjusted close value for our analysis, as this accounts for stock splits, dividends, etc.
+
+Essentially, our approach for this case study is as follows: 
+Import/format the data through Yahoo! Finance,
+Compute and illustrate the ratio of the 2 stocks, 
+Find opening/closing positions and the resulting profit given a value of k which determines the critical distance of the ratio from the average,
+Train the model to find the optimal value of k on the first few years of data, then test this k value on the remaining data. 
+Ultimately, we want to model and simulate realistic stock prices with varying parameters to find which attributes of stocks yield the best results when using the pairs trading method. Finally, of course we want to optimize the process.
+
+To begin, we want to create a function to read in the data from Yahoo! Finance. This function will take in a stock ticker and will read the data in. Ideally, we could have this go retrieve the stock data directly from the website, but the site has changed since the author wrote this case study and with the new format of the site we were unable to make this work. Instead, we manually downloaded all available information for the stocks we wanted to examine. We use the following function to read this data into our environment.
+
+```{r}
+readData = function(symbol, dateFormat = c("%Y-%m-%d", "%Y/%m/%d"), ...) {
+ 
+  # Construct the file path based on the inputted symbol 
+  fileName = paste0("C:/Users/mikem/Downloads/", symbol, ".csv")
+  
+  #read the data in, keep the dates as strings using the stringsAsFactors paramter
+  data = read.csv(fileName, header = TRUE, stringsAsFactors = FALSE, ...)
+  
+  #format the data
+  for(fmt in dateFormat) {
+    tmp = as.Date(data$Date, fmt)
+    if(all(!is.na(tmp))) {
+      data$Date = tmp
+      break
+    }
+  }
+  
+  data[order(data$Date),]
+}
+```
+
+Now we can read in the data for some stocks
+
+```{r}
+apple<-readData("AAPL")
+microsoft<-readData("MSFT")
+head(apple)
+```
+
+Now that we have the data, we want to plot the time series of the ratio of these two stocks. We also want to include a visual of the mean using a dashed green line, and the boundary that is the k value times the standard deviation of the ratios.
+
+In order to do this we must first identify the time period that the data is available for both stocks. We write a function to do this and return the dates, stock prices, and we added the parameter addRatio so that the user can specify if they want a column of the ratios included or not.
+
+```{r}
+#Combining two stocks
+combine2Stocks = function(a, b, stockNames = c(deparse(substitute(a)),deparse(substitute(b))), addRatio = FALSE) {
+  rr = range(intersect(a$Date, b$Date))
+  a.sub = a[a$Date >= rr[1] & a$Date <= rr[2],]
+  b.sub = b[b$Date >= rr[1] & b$Date <= rr[2],]
+  
+  #additional parameter with default =FALSE. If specified TRUE, include the ratio in the dataframe
+  if (addRatio) {
+    ratio = a.sub$Adj.Close / b.sub$Adj.Close
+    structure(data.frame(a.sub$Date, a.sub$Adj.Close, b.sub$Adj.Close, ratio),
+              names = c("Date", stockNames, "Ratio"))
+  } else {
+    structure(data.frame(a.sub$Date, a.sub$Adj.Close, b.sub$Adj.Close),
+              names = c("Date", stockNames))
+  }
+}
+
+head(combine2Stocks(apple, microsoft, addRatio = T))
+```
+
+Now we write a function to plot the time series of the ratio. 
+
+```{r}
+plotRatio =
+  function(r, k = 1, date = seq(along = r), meanColor = "darkgreen", thresholdColor = "red", ...){
+    title= paste(deparse(substitute(stockA)), " vs. ", deparse(substitute(stockB)), " time series")
+    plot(date, r, type = "l", ...)
+    
+    abline(h = c(mean(r),
+                 mean(r) + k * sd(r),
+                 mean(r) - k * sd(r)),
+           col = c(meanColor, rep(thresholdColor, 2*length(k))),
+           lty = "dashed")
+    text(x = min(date), y = mean(r) + k * sd(r), labels = paste0("k = ", k), pos = 4, col = "red")
+    text(x = min(date), y = mean(r) - k * sd(r), labels = paste0("k = ", k), pos = 4, col = "red")
+  }
+```
+
+Notice that we wrote the function such that it accepts a vector for the critical k value. This is why we used col = c(meanColor, rep(thresholdColor, 2*length(k))) to get the color of the horizontal lines. This allows us to visualize multiple k values on the same time series.
+
+```{r}
+overlap <- combine2Stocks(apple,microsoft, addRatio = T)
+r <- overlap$apple/overlap$microsoft
+plotRatio(r, k=c(0.5,1), col = "gray", ylab = "ratio", main = "Apple vs. Microsoft Time Series")
+  
+```
+
+Now we want to find the positions where we will open and close positions. We write a function findNextPosition() to find the next position given a starting positions. Then we write getPositions to apply this function to the entire period of interest.
+
+```{r}
+findNextPosition =
+  # e.g., findNextPosition(r)
+  #   findNextPosition(r, 1174)
+  # Check they are increasing and correctly offset
+  function(ratio, startDay = 1, k = 1,
+           m = mean(ratio), s = sd(ratio)){
+    up = m + k *s
+    down = m - k *s
+    if(startDay > 1)
+      ratio = ratio[- (1:(startDay-1))]
+    isExtreme = ratio >= up | ratio <= down
+    if(!any(isExtreme))
+      return(integer())
+    start = which(isExtreme)[1]
+    backToNormal = if(ratio[start] > up)
+      ratio[- (1:start)] <= m
+    else
+      ratio[- (1:start)] >= m
+    # return either the end of the position or the index
+    # of the end of the vector.
+    # Could return NA for not ended, i.e. which(backToNormal)[1]
+    # for both cases. But then the caller has to interpret that.
+    end = if(any(backToNormal))
+      which(backToNormal)[1] + start
+    else
+      length(ratio)
+    c(start, end) + startDay - 1
+  }
+findNextPosition(overlap$Ratio)
+```
+Now lets quickly test the function to make sure it is working as it is supposed to.
+
+```{r}
+#testing
+r<- overlap$Ratio
+a<- findNextPosition(r, startDay=1,k=1)
+a
+b<- findNextPosition(r, startDay=a[2], k=1)
+b
+c<- findNextPosition(r,startDay= b[2], k=1)
+c
+```
+The function is working well. It may seem repetitive to compute whether the ratio exceeds the bounds for all values in the vector. To avoid this we would need to loop over each ratio to find the first one to exceed the bounds. This would be less efficient than using the vectorized expression isExtreme = ratio >= up | ratio <= down. 
+
+Now we want to display these positions on the time series. We write a function to do so.
+
+```{r}
+showPosition1 = function(days, ratios, radius = 70){
+    
+    symbols(days, ratios,
+            circles = rep(radius, 2), add = TRUE, inches = FALSE,fg = c("darkgreen", "red") )
+  }
+
+#testing
+plotRatio(r, k=1, overlap$Date, col = "gray", xlab = "Date", ylab = "Ratio")
+showPosition1(overlap$Date[a], r[a], radius = 150)
+showPosition1(overlap$Date[b], r[b], radius = 150)
+showPosition1(overlap$Date[c], r[c], radius = 150)
+```
+
+Now lets write the function to apply findNextPosition() to the entire time series.
+
+```{r}
+getPositions =
+  function(ratio, k = 1, m = mean(ratio), s = sd(ratio)){
+    when = list()
+    cur = 1
+    while(cur < length(ratio)) {
+      tmp = findNextPosition(ratio, cur, k, m, s)
+      if(length(tmp) == 0) # done
+        break
+      when[[length(when) + 1]] = tmp
+      if(is.na(tmp[2]) || tmp[2] == length(ratio))
+        break
+      cur = tmp[2]
+    }
+    when
+  }
+
+#testing
+k = 1
+pos = getPositions(r, k)
+plotRatio(r, k, overlap$Date,col = "gray", xlab = "Date", ylab = "Ratio")
+invisible(lapply(pos, function(p)
+      showPosition1(overlap$Date[p], r[p], radius = 150)))
+```
+
+We have to update showPosition() so that we can pass the entire list of positions for the time series.
+
+```{r}
+showPosition =
+  function(days, ratio, radius = 70){
+    if(is.list(days))
+      days = unlist(days)
+    symbols(days, ratio[days],
+            circles = rep(radius, length(days)),
+            fg = c("darkgreen", "red"),
+            add = TRUE, inches = FALSE)
+  }
+
+
+k = .5
+pos = getPositions(r, k)
+plotRatio(r, k, col = "gray", ylab = "ratio")
+showPosition(pos, r)
+```
+
+Now that we have the positions for the entire time series identified, we want to compute the profit for each of these positions
+
+```{r}
+positionProfit =
+  #r = overlap$stockA/overlap$stockB
+  #k = 1.7
+  #pos = getPositions(r, k)
+  #positionProfit(pos[[1]], overlap$stockA, overlap$stockB)
+  function(pos, stockPriceA, stockPriceB,
+           ratioMean = mean(stockPriceA/stockPriceB),
+           p = .001, byStock = F){
+    if(is.list(pos)) {
+      ans = sapply(pos, positionProfit,
+                   stockPriceA, stockPriceB, ratioMean, p, byStock)
+      if(byStock)
+        rownames(ans) = c("A", "B", "commission")
+      return(ans)
+    }
+    # prices at the start and end of the positions
+    priceA = na.omit(stockPriceA[pos])
+    priceB = na.omit(stockPriceB[pos])
+    # how many units can we by of A and B with $1
+    unitsOfA = 1/priceA[1]
+    unitsOfB = 1/priceB[1]
+    # The dollar amount of how many units we would buy of A and B
+    # at the cost at the end of the position of each.
+    amt = c(unitsOfA * priceA[2], unitsOfB * priceB[2])
+    # Which stock are we selling
+    sellWhat = if(priceA[1]/priceB[1] > ratioMean) "A" else "B"
+    
+    if(sellWhat == "A"){
+      profit =  c((1 - amt[1]), (amt[2] - 1), - p * sum(amt))
+    } else {
+      profit =  c((1 - amt[2]), (amt[1] - 1), - p * sum(amt))
+    } 
+    if(byStock){
+      profit = profit
+    } else {
+      sum(profit)
+    }
+  } 
+
+#testing
+pf = positionProfit(c(1, 2), c(3838.48, 8712.87),
+      c(459.11, 1100.65), p = 0)
+prof = positionProfit(pos, overlap$apple, overlap$microsoft, mean(r))
+```
+
+We now have all the functions necessary to compare any 2 stocks and find the resulting profits given a specified k value. 
+We want to develop a function to find the optimal value of k to maximize profits. We train the model to find the optimal k value on the first 5 years of data, then we apply this k value to the remaining data and return the resulting profit from this. 
+
+```{r}
+optimalReturn <- function(stockA, stockB, lengthTrain = "5 years"){
+  
+  #taking only the common dates and computing ratios
+  overlap <- combine2Stocks(stockA,stockB, addRatio = T)
+  r <- overlap$stockA/overlap$stockB
+  
+  #creating training and testing vectors
+  i = 1:floor(nrow(overlap)/2)
+  train = overlap[i,]
+  test = overlap[- i,]
+
+  #training data
+  r.train = train$stockA/train$stockB
+  r.test = test$stockA/test$stockB
+
+  #we are going to train the model on the first 5 years of data from when we have data for both stocks
+  #the rest of the data is for testing
+  
+  #establish training period. lengthTrain = "5 years" by default
+  train.period = seq(min(overlap$Date), by = lengthTrain, length =2)
+  
+  #use this vector of length 2 of class Data to subset the stock price vectors to compute the ratio time series for the given sequence
+  stockA.train = subset(stockA, Date >= train.period[1] &
+                        Date < train.period[2])$Adj.Close
+  stockB.train = subset(stockB,
+                      Date >= train.period[1] &
+                        Date < train.period[2])$Adj.Close
+  
+  #compute ratio of training data
+  r.train = stockA.train/stockB.train
+
+  #now do the same thing but using the remaining data for the test data.
+  stockA.test = subset(stockA, Date > train.period[2] & Date < "2023-01-01")$Adj.Close
+  stockB.test = subset(stockB, Date > train.period[2] & Date < "2023-01-01")$Adj.Close
+  r.test = stockA.test/stockB.test
+
+  #Now we want to find optimal value of k to maximize profit
+  #we find the optimal k for the training data and then we apply this to the testing data
+  #choose largest k to be value such that the ratio never crosses these bounds and vice versa for      min
+  k.max = max((r.train - mean(r.train))/sd(r.train)) 
+  k.min = min((abs(r.train - mean(r.train))/sd(r.train)))
+
+  ks = seq(k.min, k.max, length = 1000)
+  m = mean(r.train)
+
+  profits =
+    sapply(ks,function(k) {
+     pos = getPositions(r.train, k)
+      sum(positionProfit(pos, train$stockA, train$stockB))
+    })
+
+  plot(ks, profits, type = "l", xlab = "k", ylab = "Profit")
+
+#find k that maximizes profits for training data
+  ks[profits == max(profits, na.rm=T)]
+  
+#in case multiple k values yield same profit
+  k.star = mean(ks[profits == max(profits, na.rm=T)], na.rm=T) 
+  
+#calculate ROI on $1 investment on training data using optimal k
+  roi<- max(profits, na.rm=T)
+  
+#now, using this optimal k.star value on the test data
+  pos = getPositions(r.test, k.star, mean(r.train), sd(r.train))
+testProfit = sum(positionProfit(pos, test$stockA,test$stockB), na.rm=T)
+testProfit
+}
+
+#testing
+optimalReturn(apple, microsoft)
+```
+
+This returns the optimized return for the test profit and the plot of profit vs. k values.
+
+Now that we have this function defined, we ran it on a number of correlated stock pairs and tried to identify any interesting trends. It was difficult to see anything meaningful this way. We want to be able to identify which attributes of a pair of stocks correlate to greater success using this strategy. In order to do so we build a mathematical model of two correlated time series.
+
+
+
+$$
+X_{t}^{(1)}=\rho \cdot X_{t-1}^{(1)}+\psi \cdot X_{t-1}^{(1)}+\epsilon_{t}^{(1)}\hspace{1cm}(1)\\
+$$
+
+$$
+X_{t}^{(2)}=\rho \cdot X_{t-1}^{(2)}+\psi \cdot X_{t-1}^{(2)}+\epsilon_{t}^{(2)}\hspace{1cm}(2)\\
+$$
+
+
+$$
+\epsilon_{t}^{(i)}\sim{}N(0,\sigma_{i}^2)
+$$
+
+
+In this model, $\rho$ controls the correlation between daily prices within the stock itself, while $\psi$ controls the between-stock correlation for the prices. Each stock has an additive random term with its own standard deviation. However, we don’t want these time series to fluctuate around a mean of 0 so we add a simple linear trend. 
+
+$$
+Y_{t}^{(1)}=\beta_{0}^{(1)} +\beta_{1}^{(1)} \cdot t + X_{t}^{(1)} \hspace{1cm}(3)\\
+Y_{t}^{(2)}=\beta_{0}^{(2)} +\beta_{1}^{(2)} \cdot t + X_{t}^{(2)} \hspace{1cm}(4)\\
+$$
+
+Here, $Y_{t}$ is the individual stock price, $\beta_{1}$ represents the linear trend in price, and $X_{t}$ provides the correlation factor as previously defined.
+Now we have a simple model that is fairly flexible. Rather than working with the equations mathematically, we will simulate actual time series from the two equations. We want to understand how our pairs trading “algorithm” or rule performs as we vary the 8 different parameters. 
+
+To begin, lets map these equations into R. Knowing that we will be simulating many different parameters, we want to keep the efficiency of the code in mind.
+
+We can easily vectorize the generation of the linear terms in equations 3 & 4 using the following:
+
+```{r}
+#setting default values:
+
+n = 4000
+sigma = rep(1, 2)
+beta0 = rep(100, 2)
+beta1 = rep(0, 2)
+
+#equations:
+Y1 <- beta0[1] + beta1[1] * (1:n)
+Y2 <- beta0[2] + beta1[2] * (1:n)
+```
+
+We can create a 2 row matrix of randomized normal values for $\epsilon$
+
+```{r}
+epsilon = matrix(rnorm(2 * n, sd = sigma), ncol = 2, byrow = TRUE)
+```
+
+We can create a 2 column matrix to store the values of X
+
+```{r}
+X <- matrix(0, nrow = n, ncol = 2)
+    X[1,] <- epsilon[1,]
+    rho = 0.99
+    psi = 0
+    A <- matrix(c(rho, psi*(1-rho), psi*(1-rho), rho), nrow = 2)
+    for(i in 2:n)
+      X[i,] = A %*% X[i-1,] + epsilon[i,]
+    # Add in the trends, in place
+    X[,1] <- beta0[1] + beta1[1] * (1:n) + X[,1]
+    X[,2] <- beta0[2] + beta1[2] * (1:n) + X[,2]
+```
+
+Notice we used the folliwing matrix multiplication to compute the first two terms of each equation, A.
+
+$$
+\begin{equation*}
+  \begin{bmatrix}
+        \rho & \psi \cdot (1-\rho)  \\
+        \psi \cdot (1-\rho) & \rho \\
+      \end{bmatrix}
+      \cdot
+      \begin{bmatrix}
+      X_{t-1}^{(1)}\\
+      X_{t-1}^{(2)}\\
+      \end{bmatrix}
+\end{equation*}
+$$
+
+Putting all of this together, we can write the function to simulate two stocks:
+
+```{r}
+stockSim =
+  function(n = 4000, rho = 0.99, psi = 0, sigma = rep(1, 2),
+           beta0 = rep(100, 2), beta1 = rep(0, 2),
+           epsilon = matrix(rnorm(2*n, sd = sigma),
+                            nrow = n, byrow = TRUE)){
+    X <- matrix(0, nrow = n, ncol = 2)
+    X[1,] <- epsilon[1,]
+    A <- matrix(c(rho, psi*(1-rho), psi*(1-rho), rho), nrow = 2)
+    for(i in 2:n)
+      X[i,] <- A %*% X[i-1,] + epsilon[i,]
+    # Add in the trends, in place
+    X[,1] <- beta0[1] + beta1[1] * (1:n) + X[,1]
+    X[,2] <- beta0[2] + beta1[2] * (1:n) + X[,2]
+    X
+  }
+
+#testing the function
+a <- stockSim(rho = .99, psi = 0.9, beta1 = c(0.05, 0.1))
+matplot(1:nrow(a), a, type = "l", xlab = "Day", ylab = "Y",
+        col = c("black", "grey"), lty = "solid")
+```
+
+Now we want to write a function to explore varying parameters and return the profit distribution.
+Before we do that, we need to write a function that will simulate the algorithm on two generated stocks.
+
+```{r}
+runSim =
+  function(rho, psi, beta0 = c(100, 100), beta1 = c(0, 0),
+           sigma = c(1, 1), n = 4000){
+    X = stockSim(n, rho, psi, sigma, beta = beta0, beta1 = beta1)
+    train = X[1:floor(n/2),]
+    test = X[(floor(n/2)+1):n,]
+    m = mean(train[, 1]/train[, 2])
+    s = sd(train[, 1]/train[, 2])
+    k.star = getBestK(train[, 1], train[, 2], m = m, s = s)
+    getProfit.K(k.star, test[, 1], test[, 2], m, s)
+  }
+```
+
+We used the functions getBestk() and getProfit.K() which are similar to what we had previously done. They are defined as follows:
+
+```{r}
+getProfit.K <- function(k, x, y, m = mean(x/y), s = sd(x/y)){
+    pos = getPositions(x/y, k, m = m, s = s)
+    if(length(pos) == 0)
+      0
+    else
+      sum(positionProfit(pos, x, y, m))
+  }
+
+getBestK =
+  function(x, y, ks = seq(0.1, max.k, length = N), N = 100,
+           max.k = NA, m = mean(x/y), s = sd(x/y)) {
+    if(is.na(max.k)) {
+      r = x/y
+      max.k = max(r/sd(r))
+    }
+    pr.k = sapply(ks, getProfit.K, x, y, m = m, s = s)
+    median(ks[pr.k == max(pr.k)])
+  }
+```
+
+Now we can write a function to simulate varying parameters and return the profit distribution. Here, B is the number of simulations using the same set of parameters. So we run each set of parameters 999 times and collect the average profit return before varying the parameters and repeating the process.
+
+```{r}
+simProfitDist <- 
+function(..., B = 999){
+    sapply(1:B, function(i, ...) runSim(...), ...)}
+```
+
+However, this is much to slow and would take too long to simulate a large paramater space.
+When we profile the function to identify where the majority of the time is being spent, we see that the stockSim function is taking around 50% of the total run time. In order to make it faster, we rewrite the function in C following the authors instructions.
+
+```{c message = FALSE, warning=FALSE}
+stockSim(double *ans, const int *len, const double *rho,
+  const double *psi, const double *eps)
+{
+ int i,j;
+ double psi_rho = (1 - *rho) * (*psi);
+ for(i = 1, j = *len + 1; i < *len; i++, j++) {
+  ans[i] = *rho * ans[i - 1] + psi_rho * ans[j - 1] + eps[i];
+  ans[j] = *rho * ans[j - 1] + psi_rho * ans[i - 1] + eps[j];
+}
+}
+```
+
+We then use the shell command R CMD SHLIB stockSim.c to create the shared library. Then we load it into our R session using dyn.load("stockSim.so"). We now write an R function that acts as a front-end, or wrapper, for calling this C routine from R. We define this much like the R stockSim() function. It has the same parameters as the R function and performs the same basic computations. However, it coerces the inputs to the appropriate type expected by the C code and allocates space for the two time series that the C routine will create. The R code is
+
+```{r}
+stockSim.c =
+  function(n = 4000, rho = 0.99, psi = 0, sigma = rep(1, 2),
+           beta0 = rep(100, 2), beta1 = rep(0, 2),
+           epsilon = matrix(rnorm(2*n, sd = sigma),
+                            nrow = n, byrow = TRUE)){
+    X = matrix(0, nrow = n, ncol = 2)
+    X[1,] = epsilon[1,]
+    X = .C("stockSim", X, as.integer(n), rho, psi, epsilon)[[1]]
+    # Add in the trends
+    X[,1] = beta0[1] + beta1[1] * (1:n) + X[,1]
+    X[,2] = beta0[2] + beta1[2] * (1:n) + X[,2]
+    X
+  }
+```
+
+We checked to make sure it yields the same results as the original R function. Now that we know it does, we simply set stockSim = stockSim.c to avoid having to go back and change all our other functions. When we profile the code again we see that the runSim function accounts for just 10% of the total time. Now we can run a simulation varying through the parameter space.
+
+```{r}
+#create matrix of random values
+e = matrix(rnorm(2*4000, sd = c(1, 0)), 2)
+
+#create parameter space
+p = seq(0.1, 1, length = 5)
+params = as.matrix(expand.grid(p, p))
+profits = apply(params, 1,
+                function(p)
+                  median(simProfitDist(rho=p[1], psi=p[2], B = 10)))
+profits
+#return the parameters which yielded  maximum profits
+max(profits)
+which.max(profits)
+```
+
+Now we want to visualize the relationship between the parameters and profits
+```{r warning=FALSE, message=FALSE }
+#displaying relationship between parameters and profits
+library(ggplot2)
+library(plotly)
+library(reshape2)
+df = data.frame(params, profits)
+# Create 3D scatter plot with gradient colors
+fig <- plot_ly(df, x = ~Var1, y = ~Var2, z = ~profits, type = "scatter3d",
+               color = ~profits, showscale = TRUE)
+
+# Show plot
+fig
+```
+
+Through this example and further exploration, we found that the profits increase as ρ, which controls the stocks dependence on it’s price the previous day, decreases and ψ, which is the stocks correlation to the other stock in the simulation, increases. Therefore, the pairs trading approach should work the best on stocks that are highly correlated to each other and have a low dependence on their price from the previous day, in other words, highly volatile stocks.
+
+When we create the matrix of random values for the added random term using a standard deviation of 1 we find a maximum profit of 59.66%, when we decrease this deviation to 0.05, we see a large increase in maximum profits, but when we further reduce this to 0.0001(essentially no randomness), the profits return to the same range as when we were using 1. This could imply that some element of randomness is beneficial for the pairs trading strategy.
+
+We also found that when only one of the stocks has no standard deviation (no randomness) i.e. sd = c(1,0) this leads to higher profits. 
+
+Additionally, we found that when both standard deviations are large, i.e. sd = c(20,20), this had no drastic impact on the resulting profits. 
+
+Upon testing this with some stocks that we believed fit these attributes, we found that the simulation study did a reasonable job at identifying successful attributes to look for whe using the pairs trading tradegy. 
+
